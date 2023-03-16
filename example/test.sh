@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 this_dir="`dirname ${0}`"
 
-config_file=${this_dir}/gisaid_config.ini
+# move here so we can use the example config_file by default
+cd $this_dir
 
-gisaid_download 2023-03-16 -q -c "$config_file"
+gisaid_download 2023-03-16 -sq
