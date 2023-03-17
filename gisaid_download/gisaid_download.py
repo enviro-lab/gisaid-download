@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 
 from configparser import ConfigParser
+import os
 from pathlib import Path
 import argparse
 import time
+import sys
 from hpc_interact import Scripter
 try:
     # only required if downloading acknowledgement files
@@ -102,54 +104,78 @@ def checkSSH(ssh_vars):
             setattr(ssh_vars,x,new_value)
     return ssh_vars
 
-def locateConfig(config_file):
-    # if not args.config_file.exists():
-    #     args.config_file = Path("gisaid_config.ini").resolve()
-    if not config_file.exists(): raise FileNotFoundError(config_file)
-    return config_file
-
 def getVariables():
     """Gets variables from arguments and config to direct behavior"""
 
+    # parse args
     from gisaid_download.version import __version__
     parser = argparse.ArgumentParser(prog='gisaid_download_basic.py',
         description="""Download EpiCoV sequences from GISAID. WARNING: By using this software you agree GISAID's Terms of Use and reaffirm your understanding of these terms.""")
     parser.add_argument('-V', '--version', action='version', version="%(prog)s ("+__version__+")")
-    parser.add_argument("date",metavar='date: [YYYY-MM-DD]',type=str,help="download sequences up to this date")
-    parser.add_argument("-f","--filetypes",nargs="*",default=["all"],help="space delimited list of files to download - options: ['fasta','meta','ackno','all','none']")
-    parser.add_argument("-l","--location",dest="location",metavar="",nargs='+',help="space delimited list of state(s) for which data is desired (standard abbreviations allowed)")
-    parser.add_argument("-e","--episet",action="store_true",dest="get_epi_set",help="request EPI_SET for selection after any downloads")
-    parser.add_argument("-d","--downloads",nargs='?',type=Path,default=None,help="path to where you recieve downloads from your web browser")
-    parser.add_argument("-w","--epicov_dir",type=Path,help="local directory containing all related downloads - will be created if absent")
-    parser.add_argument("-c","--config_file",type=Path,default=Path("./gisaid_config.ini"),help="path to config (default: ./gisaid_config.ini)")
-    parser.add_argument("-q","--quick",action="store_false",dest="wait",help="don't wait for user to hit enter between each step")
-    parser.add_argument("-s","--skip_local_update",action="store_true",help="don't update local list of downloaded accessions (if unset, files will be retrieved from the cluster before the EpiCoV download steps)")
-    parser.add_argument("-n","--no_cluster",dest="cluster_interact",action="store_false",help="don't interact trasfer any files to/from the cluster")
+    parser.add_argument("--example",action="store_true",help="writes out an example 'gisaid_config.ini' to `outdir`")
+    parser.add_argument("-o","--outdir",type=Path,default=Path("."),help="outdir for example config file (default: current working directory)")
+    # adding these args only if user isn't requesting example config gets around `date` being a required argument, otherwise
+    if not "example" in (arg.strip("-") for arg in sys.argv):
+        example = False
+        parser.add_argument("date",metavar='date: [YYYY-MM-DD]',type=str,help="download sequences up to this date")
+        parser.add_argument("-f","--filetypes",nargs="*",default=["all"],help="space delimited list of files to download - options: ['fasta','meta','ackno','all','none']")
+        parser.add_argument("-l","--location",metavar="",nargs='+',help="space delimited list of state(s) for which data is desired (standard abbreviations allowed)")
+        parser.add_argument("-e","--episet",action="store_true",dest="get_epi_set",help="request EPI_SET for selection after any downloads")
+        parser.add_argument("-d","--downloads",nargs='?',type=Path,default=None,help="path to where you recieve downloads from your web browser")
+        parser.add_argument("-w","--epicov_dir",type=Path,default=None,help="local directory containing all related downloads - will be created if absent")
+        parser.add_argument("-b","--cluster_epicov_dir",type=Path,default=None,help="local directory containing all related downloads - will be created if absent")
+        parser.add_argument("-c","--config_file",type=Path,default=Path("./gisaid_config.ini"),help="path to config (default: ./gisaid_config.ini)")
+        parser.add_argument("-q","--quick",action="store_false",dest="wait",help="don't wait for user to hit enter between each step")
+        parser.add_argument("-s","--skip_local_update",action="store_true",help="don't update local list of downloaded accessions (if unset, files will be retrieved from the cluster before the EpiCoV download steps)")
+        parser.add_argument("-n","--no_cluster",dest="cluster_interact",action="store_false",help="don't interact trasfer any files to/from the cluster")
+    else:
+        example = True
     args = parser.parse_args()
-    if not len(args.date) == 10 or not "-" in args.date:
-        if "unfiltered" in args.date: pass
-        else: warn("Date must be of the format 'YYYY-MM-DD'")
 
-    args.config_file = locateConfig(args.config_file)
-    # get config variables
-    config = ConfigParser(converters={'list': lambda x: [i.strip() for i in x.split(',')]})
-    config.read(args.config_file)
-    ssh_vars = get_elements(config,"SSH",("site","group","login_config"))
-    path_var_list = ("epicov_dir","cluster_epicov_dir","downloads")
-    path_vars = get_elements(config,"Paths",path_var_list)
-    args.epicov_dir,cluster_epicov_dir,args.downloads = [getattr(path_vars,val) for val in path_var_list]
-    followup_command = config["Misc"].get("followup_command")
-    ssh_vars.add_var("cluster_epicov_dir",cluster_epicov_dir)
-    ssh_vars.add_var("local_epicov_dir",args.epicov_dir)
-    ssh_vars = checkSSH(ssh_vars)
-    if type(args.downloads) == type(None): args.downloads = findDownloadsDir(args.downloads)
-    args.filetypes = config.getlist("Misc","filetypes")
-    args.location = config.getlist("Misc","location")
-    print(args.epicov_dir,ssh_vars.cluster_epicov_dir,ssh_vars,args.filetypes,args.location)
-    file_choices = determineFileTypesToDownload(args.filetypes)
-    args.epicov_dir.mkdir(parents=True, exist_ok=True)
+    # variable cleanup
+    if example:
+        # ensure all these attribtes exist - they won't be used, but the return statement need them
+        for var in ["date","filetypes","location","get_epi_set","downloads","epicov_dir","cluster_epicov_dir","config_file","wait","skip_local_update","cluster_interact"]:
+            setattr(args,var,None)
+        file_choices,ssh_vars,followup_command,custom_filters = [None]*4
+    else:
+        # notify if date has incorrect format - not worth failing script over, though
+        if not len(args.date) == 10 or not "-" in args.date:
+            print(f"WARNING: `date` ({args.date}) not in expected format 'YYYY-MM-DD'")
 
-    return args.date,args.location,args.downloads,file_choices,args.get_epi_set,args.epicov_dir,ssh_vars,args.wait,args.skip_local_update,followup_command,args.cluster_interact
+        # get config variables
+        if not args.config_file.exists(): raise FileNotFoundError(args.config_file)
+        config = ConfigParser(converters={'list': lambda x: [i.strip() for i in x.split(',')]})
+        config.read(args.config_file)
+
+        # vars that may come from config
+        followup_command = config["Misc"].get("followup_command")
+        ssh_vars = get_elements(config,"SSH",("site","group","login_config"))
+        path_var_list = ("epicov_dir","cluster_epicov_dir","downloads")
+        path_vars = get_elements(config,"Paths",path_var_list)
+        custom_filters = [y for y in (x.strip(",") for x in config["Misc"].get("custom_filters","").split("\n")) if y]
+        epicov_dir,cluster_epicov_dir,downloads = [getattr(path_vars,val) for val in path_var_list]
+        filetypes = config.getlist("Misc","filetypes")
+        location = config.getlist("Misc","location")
+
+        # prioritize cli version of these but use config default (if possible) if they don't exist
+        for var in ("epicov_dir","cluster_epicov_dir","filetypes","location"):
+            if not getattr(args,var,None):
+                default_from_config = locals().get(var)
+                if not default_from_config:
+                    raise AttributeError(f"Attribute `{var}` must be provided in config or arguments.")
+                else:
+                    setattr(args,var,default_from_config)
+        
+        # finalize & return variables
+        if type(args.downloads) == type(None): args.downloads = findDownloadsDir(args.downloads)
+        ssh_vars.add_var("cluster_epicov_dir",args.cluster_epicov_dir)
+        ssh_vars.add_var("local_epicov_dir",args.epicov_dir)
+        ssh_vars = checkSSH(ssh_vars)
+        file_choices = determineFileTypesToDownload(args.filetypes)
+        args.epicov_dir.mkdir(parents=True, exist_ok=True)
+
+    return args.date,args.location,args.downloads,file_choices,args.get_epi_set,args.epicov_dir,ssh_vars,args.wait,args.skip_local_update,followup_command,args.cluster_interact,custom_filters,example,args.outdir
 
 def continueFromHere(runthrough=None):
     """Prints a showy line so users can easily find where they left off"""
@@ -342,8 +368,6 @@ def isCorrectTsv(fh,fields):
         print("Extra fields:",cols - set(fields))
     return not set(fields) - cols
 
-
-
 def looksLikeCorrectFile(file_type,file,fields=None):
     """Returns True if file is of correct type and has expected contents
 
@@ -427,15 +451,38 @@ def getEpicovAcessionFile(all_gisaid_seqs_name,accession_dir,location,location_l
                 action_input="CSV")
     return all_gisaid_seqs
 
-def prepareFilters(date):
+allowed_actions = ("click","fill","print")
+def add_filter_step(action:str,date):
+    """Adds custom actions (like click, fill, or print) to be executed by script to guide user through which filters to select
+
+    Args:
+        action (str): a function to execute
+    """
+
+    # only conduct allowed actions
+    if action.split("(",1)[0] in allowed_actions:
+        if action.startswith("print("):
+            print("\t",end='')
+        exec(action)
+    else:
+        print(f"\t{action}")
+
+def prepareFilters(date,custom_filters=None):
     """Directs which filters need to be selected (based on the UNC Charlotte Environmental Monitoring Laboratory's standards)"""
+
 
     print("\nPreparing filters - ensure these are set (or use your own filters if this is a non-standard run)\n")
     click("Search")
-    click("Low coverage excluded","checkbox")
-    click("Collection date complete","checkbox")
-    fill("Collection to (2nd box)",(date))
-    fill("Host","Human")
+
+    if custom_filters:
+        for action in custom_filters:
+            add_filter_step(action,date)
+    else:
+        click("Low coverage excluded","checkbox")
+        click("Collection date complete","checkbox")
+        fill("Collection to (2nd box)",(date))
+        fill("Host","Human")
+
 
 def save_accessions(new_seq_files,accession_dir):
     """Saves accession files to accession dir so they won't be redownloaded in future runs"""
@@ -445,7 +492,7 @@ def save_accessions(new_seq_files,accession_dir):
             print("moving",file,"to",accession_dir.joinpath(file.name))
             file.rename(accession_dir.joinpath(file.name))
 
-def download_data(locations,date,downloads,accession_dir,file_choices,outdir,wait,get_epi_set):
+def download_data(locations,date,downloads,accession_dir,file_choices,outdir,wait,get_epi_set,custom_filters):
     """Guided download of requested data for each location requested"""
 
     epicov_files = []
@@ -453,7 +500,7 @@ def download_data(locations,date,downloads,accession_dir,file_choices,outdir,wai
     download_limit = 10000 #This is the limit imposed by GISAID
 
     for location in locations:
-        prepareFilters(date)
+        prepareFilters(date,custom_filters)
 
         location_long = getState(location)
 
@@ -548,7 +595,13 @@ def main():
       * with config (default config: ./gisaid_config.ini):
       `python gisaid_download.py 2022-04-06 -c /path/to/config_file.ini`
     """
-    date,locations,downloads,file_choices,get_epi_set,epicov_dir,ssh_vars,wait,skip_local_update,followup_command,cluster_interact = getVariables()
+    date,locations,downloads,file_choices,get_epi_set,epicov_dir,ssh_vars,wait,skip_local_update,followup_command,cluster_interact,custom_filters,example,outdir = getVariables()
+
+    # get example config and exit, if requested
+    if example:
+        from example import file_getter
+        file_getter.get_example_config(outdir)
+        exit()
 
     # set and make storage directories if needed
     local_accession_dir = Path(f"{epicov_dir}/accession_info")
@@ -566,7 +619,7 @@ def main():
 
     # get any/all desired data from GISAID
     if file_choices:
-        epicov_files,new_seq_files,get_epi_set = download_data(locations,date,downloads,local_accession_dir,file_choices,meta_dir,wait,get_epi_set)
+        epicov_files,new_seq_files,get_epi_set = download_data(locations,date,downloads,local_accession_dir,file_choices,meta_dir,wait,get_epi_set,custom_filters)
 
     # get epi_set for all current acccesions if requested
     if get_epi_set: acquireEpiSet(date,epicov_files,downloads)
