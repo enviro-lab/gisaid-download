@@ -26,7 +26,6 @@ def findDownloadsDir(downloads):
 
     # attempt to determine location
     if downloads: return downloads
-    print(Path("/mnt").is_dir())
     if Path("/mnt").is_dir():
         possible_download_dirs = list(Path("/mnt").glob("*/Users/*/Downloads"))
     elif Path("/mnt").is_dir():
@@ -36,7 +35,6 @@ def findDownloadsDir(downloads):
     if len(possible_download_dirs) == 1: pass
     else:
         possible_download_dirs = ([d for d in possible_download_dirs if not "Public" in str(d) and not "Default" in str(d)])
-    print(possible_download_dirs)
     if len(possible_download_dirs) == 1:
         return possible_download_dirs[0]
     # request location, because can't find it
@@ -58,19 +56,22 @@ def getState(location):
 def determineFileTypesToDownload(filetypes):
     """Sets which filetypes will be downloaded based on `filetypes` list variable in config"""
 
-    all_types = ["fasta","meta","ackno"]
-    choices = []
-    for ft in all_types:
-        # within above order ^^^, add to list if filetype is present
-        for choice in filetypes:
-            if choice.lower() == "all":
-                return all_types
-            elif choice.lower() == "none":
-                return []
-            elif choice.lower() == ft:
-                choices.append(ft)
-                break # check next filetype
-    return choices
+    meta_files = []
+    possible_meta_files = ["date_loc","patient","seq_tech"]
+    actual_filetypes = []
+    if "fasta" in filetypes:
+        actual_filetypes.append("fasta")
+    if "meta" in filetypes:
+        meta_files = possible_meta_files
+        actual_filetypes.append("meta")
+    else:
+        overlap = set(possible_meta_files).union(filetypes)
+        if overlap:
+            actual_filetypes.append("meta")
+            meta_files = [ft for ft in filetypes if ft in possible_meta_files]
+    if "ackno" in filetypes:
+        actual_filetypes.append("ackno")
+    return actual_filetypes,meta_files
 
 class VariableHolder:
     """An object used to store and access variables"""
@@ -87,6 +88,8 @@ def get_elements(config,section,elements):
     for element in elements:
         value = config[section][element]
         if not value.strip(): value = None
+        if value == "True": value=True
+        elif value == "False": value=False
         if section == "Paths":
             if value != None:
                 value = Path(value)
@@ -118,7 +121,7 @@ def getVariables():
     if not "example" in (arg.strip("-") for arg in sys.argv):
         example = False
         parser.add_argument("date",metavar='date: [YYYY-MM-DD]',type=str,help="download sequences up to this date")
-        parser.add_argument("-f","--filetypes",nargs="*",default=["all"],help="space delimited list of files to download - options: ['fasta','meta','ackno','all','none']")
+        parser.add_argument("-f","--filetypes",nargs="*",default=[],help="space delimited list of files to download - options: ['fasta','meta','date_loc','patient','seq_tech','ackno','all','none']")
         parser.add_argument("-l","--location",metavar="",nargs='+',help="space delimited list of state(s) for which data is desired (standard abbreviations allowed)")
         parser.add_argument("-e","--episet",action="store_true",dest="get_epi_set",help="request EPI_SET for selection after any downloads")
         parser.add_argument("-d","--downloads",nargs='?',type=Path,default=None,help="path to where you recieve downloads from your web browser")
@@ -135,9 +138,9 @@ def getVariables():
     # variable cleanup
     if example:
         # ensure all these attribtes exist - they won't be used, but the return statement need them
-        for var in ["date","filetypes","location","get_epi_set","downloads","epicov_dir","cluster_epicov_dir","config_file","wait","skip_local_update","cluster_interact"]:
+        for var in ["date","filetypes","meta_files","location","get_epi_set","downloads","epicov_dir","cluster_epicov_dir","config_file","wait","skip_local_update","cluster_interact"]:
             setattr(args,var,None)
-        file_choices,ssh_vars,followup_command,custom_filters = [None]*4
+        filetype_choices,ssh_vars,followup_command,custom_filters = [None]*4
     else:
         # notify if date has incorrect format - not worth failing script over, though
         if not len(args.date) == 10 or not "-" in args.date:
@@ -150,7 +153,7 @@ def getVariables():
 
         # vars that may come from config
         followup_command = config["Misc"].get("followup_command")
-        ssh_vars = get_elements(config,"SSH",("site","group","login_config"))
+        ssh_vars = get_elements(config,"SSH",("site","group","login_config","save_credentials"))
         path_var_list = ("epicov_dir","cluster_epicov_dir","downloads")
         path_vars = get_elements(config,"Paths",path_var_list)
         custom_filters = [y for y in (x.strip(",") for x in config["Misc"].get("custom_filters","").split("\n")) if y]
@@ -172,10 +175,10 @@ def getVariables():
         ssh_vars.add_var("cluster_epicov_dir",args.cluster_epicov_dir)
         ssh_vars.add_var("local_epicov_dir",args.epicov_dir)
         ssh_vars = checkSSH(ssh_vars)
-        file_choices = determineFileTypesToDownload(args.filetypes)
+        filetype_choices,meta_files = determineFileTypesToDownload(args.filetypes)
         args.epicov_dir.mkdir(parents=True, exist_ok=True)
 
-    return args.date,args.location,args.downloads,file_choices,args.get_epi_set,args.epicov_dir,ssh_vars,args.wait,args.skip_local_update,followup_command,args.cluster_interact,custom_filters,example,args.outdir
+    return args.date,args.location,args.downloads,filetype_choices,meta_files,args.get_epi_set,args.epicov_dir,ssh_vars,args.wait,args.skip_local_update,followup_command,args.cluster_interact,custom_filters,example,args.outdir
 
 def continueFromHere(runthrough=None):
     """Prints a showy line so users can easily find where they left off"""
@@ -222,8 +225,12 @@ def awaitDownload(downloads:Path,outfile:Path,runthrough=None):
         if len(current_set) == len(already_there): pass
         else:
             newfile_set = current_set - already_there
-            if len(newfile_set) == 1: # allow any .part file to be removed to indicate successful download
+            if count % 20 == 0: print(newfile_set)
+            if len(newfile_set) >= 1: # allow any .part file to be removed to indicate successful download
                 for file in newfile_set:
+                    if ".part" in file.suffixes: break
+                    if count % 20 == 0: print(file.suffix,outfile.suffix)
+
                     if file.suffix == outfile.suffix: # file has been found
                         continueFromHere(runthrough)
                         return file
@@ -298,12 +305,12 @@ def getSelectionAsFile(runthrough,runthroughs,new_seqs,download_limit,downloads:
             out.write(f"{id}\n")
     return selection_file,len(selection)
 
-def checkSelectionSize(selection_size,file_choices,get_epi_set):
+def checkSelectionSize(selection_size,filetype_choices,get_epi_set):
     """Ensures desired activities can be done for selection size (limited by GISAID restrictions)"""
 
     if get_epi_set:
-        return get_epi_set,file_choices
-    if "ackno" in file_choices and selection_size > 500:
+        return get_epi_set,filetype_choices
+    if "ackno" in filetype_choices and selection_size > 500:
         choice = input("Your sample set has more than 500 samples, so you cannot download an acknowledgement file.\nWould you prefer to:\
             \n\t1 - request an EPI_SET at the end\
             \n\t2 - skip the acknowledgement file and skip the EPI_SET\
@@ -314,11 +321,11 @@ def checkSelectionSize(selection_size,file_choices,get_epi_set):
             get_epi_set = True
         elif choice == 2:
             get_epi_set = False
-        updated_file_choices = [f for f in file_choices if f != "ackno"]
-        print(updated_file_choices)
-        return get_epi_set,updated_file_choices
+        updated_filetype_choices = [f for f in filetype_choices if f != "ackno"]
+        print(updated_filetype_choices)
+        return get_epi_set,updated_filetype_choices
     else:
-        return get_epi_set,file_choices
+        return get_epi_set,filetype_choices
 
 def acquireEpiSet(date,epicov_files,downloads):
     """Guides user through EPI_SET acquisition"""
@@ -386,32 +393,37 @@ def looksLikeCorrectFile(file_type,file,fields=None):
             elif file_type == "meta":
                 return isCorrectTsv(fh,fields)
 
-def downloadFiles(file_choices,date,runthrough,outdir,downloads,location,selection_size,get_epi_set):
+def downloadFiles(filetype_choices,meta_files,date,runthrough,outdir,downloads,location,selection_size,get_epi_set):
     """Guides the downloading of desired files, renaming them appropriately"""
 
-    get_epi_set,file_choices = checkSelectionSize(selection_size,file_choices,get_epi_set)
+    get_epi_set,filetype_choices = checkSelectionSize(selection_size,filetype_choices,get_epi_set)
 
     file_info = {
         "fasta":[
             {"label":"Nucleotide Sequences (FASTA)","fn":f"gisaid_{location}_{date}.{runthrough}.fasta","abbr":"fasta"}],
         "meta":[
-            {"label":"Dates and Location","fn":f"gisaid_date_{location}_{date}.{runthrough}.tsv","abbr":"date & location",
+            {"label":"Dates and Location","fn":f"gisaid_date_{location}_{date}.{runthrough}.tsv","abbr":"date & location","filetypes_abbr":"date_loc",
             "fields":["Accession ID","Collection date","Submission date","Location"]},
-            {"label":"Patient status metadata","fn":f"gisaid_pat_{location}_{date}.{runthrough}.tsv","abbr":"patient status",
+            {"label":"Patient status metadata","fn":f"gisaid_pat_{location}_{date}.{runthrough}.tsv","abbr":"patient status","filetypes_abbr":"patient",
             "fields":["Virus name","Accession ID","Collection date","Location","Host","Additional location information"," Sampling strategy","Gender","Patient age","Patient status","Last vaccinated","Passage","Specimen","Additional host information","Lineage","Clade","AA Substitutions"]},
-            {"label":"Sequencing technology metadata","fn":f"gisaid_seq_{location}_{date}.{runthrough}.tsv","abbr":"sequence tech",
+            {"label":"Sequencing technology metadata","fn":f"gisaid_seq_{location}_{date}.{runthrough}.tsv","abbr":"sequence tech","filetypes_abbr":"seq_tech",
             "fields":["Virus name","Accession ID","Collection date","Location","Host","Passage","Specimen","Additional host information","Sequencing technology","Assembly method","Comment","Comment type","Lineage","Clade","AA Substitutions"]}],
         "ackno":[
             {"label":"Acknowledgement table","fn":f"gisaid_ackno_{location}_{date}.{runthrough}.pdf","abbr":"ack_pdfnew"}]
     }
     # download all desired files
-    for file_type in file_choices:
+    for file_type in filetype_choices:
+        done_once = False
         for file_dict in file_info[file_type]:
             name = Path(file_dict["fn"])
             runinfo = f"{location} {file_dict['label']} #{runthrough}"
             if not outdir.joinpath(name).exists():
-                if runthrough == 0 and name.suffix=="fasta":
+                if file_type == "meta":
+                    if file_dict["filetypes_abbr"] not in meta_files:
+                        continue
+                if runthrough == 0 and done_once == False:
                     click("OK (twice)")
+                    done_once = True
                 print(f"\nPreparing to download {runinfo}\n")
                 # loop through download - if it looks like user got wrong file, try again
                 while 1:
@@ -492,7 +504,7 @@ def save_accessions(new_seq_files,accession_dir):
             print("moving",file,"to",accession_dir.joinpath(file.name))
             file.rename(accession_dir.joinpath(file.name))
 
-def download_data(locations,date,downloads,accession_dir,file_choices,outdir,wait,get_epi_set,custom_filters):
+def download_data(locations,date,downloads,accession_dir,filetype_choices,meta_files,outdir,wait,get_epi_set,custom_filters):
     """Guided download of requested data for each location requested"""
 
     epicov_files = []
@@ -538,7 +550,7 @@ def download_data(locations,date,downloads,accession_dir,file_choices,outdir,wai
                 print("\tor\n\tskip this runthrough (if you know these files already exist)")
                 awaitEnter(wait=wait)
 
-                get_epi_set = downloadFiles(file_choices,date,runthrough,outdir,downloads,location,selection_size,get_epi_set)
+                get_epi_set = downloadFiles(filetype_choices,meta_files,date,runthrough,outdir,downloads,location,selection_size,get_epi_set)
         elif len(new_seq_list) == 0:
             print("No new seqs available to be downloaded for", location_long)
             continueFromHere()
@@ -548,34 +560,33 @@ def download_data(locations,date,downloads,accession_dir,file_choices,outdir,wai
 def getScripter(ssh_vars:VariableHolder,mode="sftp"):
     """Instantiates a Scripter object for ssh/sftp interactions with the cluster"""
 
-    # return Scripter(username=ssh_vars.username, password=ssh_vars.password, site=ssh_vars.site, mode=mode, group=ssh_vars.group)
-    return Scripter(site=ssh_vars.site, mode=mode, group=ssh_vars.group)
+    return Scripter(site=ssh_vars.site, mode=mode, group=ssh_vars.group, save_credentials=ssh_vars.save_credentials, config=ssh_vars.login_config)
 
-def upload_data(ssh_vars,date):
+def upload_data(ssh_vars:VariableHolder,scripter:Scripter,date:str):
     """Uploads the downloads from this session to the cluster"""
 
     outdir = Path(ssh_vars.cluster_epicov_dir)
     local_dir = Path(ssh_vars.local_epicov_dir)
-    scripter = getScripter(ssh_vars)
+    scripter.reset_mode("sftp")
     for loc in ("gisaid_metadata","accession_info"):
         scripter.put(local_dir/loc/f"*{date}*", outdir/loc, options=[],set_permissions=True)
     scripter.preview_steps()
     scripter.run()
 
-def update_accessions(ssh_vars):
+def update_accessions(ssh_vars:VariableHolder,scripter:Scripter):
     """Downloads accession CSVs from cluster to determine which accessions have already been downloaded"""
 
     cluster_dir = Path(ssh_vars.cluster_epicov_dir)
     local_dir = Path(ssh_vars.local_epicov_dir)
-    scripter = getScripter(ssh_vars)
+    scripter.reset_mode("sftp")
     scripter.get(cluster_dir/"accession_info/*", local_dir/"accession_info", options=["a"])
     scripter.preview_steps()
     scripter.run()
 
-def run_followup_cluster_command(ssh_vars,followup_command,date):
+def run_followup_cluster_command(scripter:Scripter,followup_command,date):
     """Runs (on the cluster) the script/command from `followup_command` which presumably initiates analysis of these downloaded data"""
 
-    scripter = getScripter(ssh_vars,mode="ssh")
+    scripter.reset_mode("ssh")
     scripter.add_step(followup_command.replace("<date>",date))
     scripter.preview_steps()
     scripter.run()
@@ -595,7 +606,7 @@ def main():
       * with config (default config: ./gisaid_config.ini):
       `python gisaid_download.py 2022-04-06 -c /path/to/config_file.ini`
     """
-    date,locations,downloads,file_choices,get_epi_set,epicov_dir,ssh_vars,wait,skip_local_update,followup_command,cluster_interact,custom_filters,example,outdir = getVariables()
+    date,locations,downloads,filetype_choices,meta_files,get_epi_set,epicov_dir,ssh_vars,wait,skip_local_update,followup_command,cluster_interact,custom_filters,example,outdir = getVariables()
 
     # get example config and exit, if requested
     if example:
@@ -610,7 +621,8 @@ def main():
 
     # update local copy of downloaded accessions
     if cluster_interact:
-        if not skip_local_update: update_accessions(ssh_vars)
+        scripter = getScripter(ssh_vars)
+        if not skip_local_update: update_accessions(ssh_vars,scripter)
         else: print("Skipping cluster/local data update")
 
     print(f"\nGuiding you through downloading EpiCoV data up through {date}\n")
@@ -618,8 +630,8 @@ def main():
     awaitEnter(wait=wait)
 
     # get any/all desired data from GISAID
-    if file_choices:
-        epicov_files,new_seq_files,get_epi_set = download_data(locations,date,downloads,local_accession_dir,file_choices,meta_dir,wait,get_epi_set,custom_filters)
+    if filetype_choices:
+        epicov_files,new_seq_files,get_epi_set = download_data(locations,date,downloads,local_accession_dir,filetype_choices,meta_files,meta_dir,wait,get_epi_set,custom_filters)
 
     # get epi_set for all current acccesions if requested
     if get_epi_set: acquireEpiSet(date,epicov_files,downloads)
@@ -630,11 +642,11 @@ def main():
 
     if cluster_interact:
         # upload data to the cluster via sftp
-        upload_data(ssh_vars,date)
+        upload_data(ssh_vars,scripter,date)
 
         # start data prep (or run whatever command was provided)
         if followup_command:
-            run_followup_cluster_command(ssh_vars,followup_command,date)
+            run_followup_cluster_command(scripter,followup_command,date)
 
 if __name__ == "__main__":
     main()
